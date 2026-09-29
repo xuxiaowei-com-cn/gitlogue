@@ -74,6 +74,167 @@ jobs:
           prefix-key: v2-rust
       - run: cargo build --release
 
+  build-loongarch64:
+    name: Build (LoongArch64)
+    # LoongArch64 (龙芯) is cross-compiled from an x86_64 runner with a GNU
+    # toolchain (glibc sysroot), mirroring the released
+    # loongarch64-unknown-linux-gnu artifact. ubuntu-24.04 is required because
+    # QEMU 8.2 (used for the smoke test below) is the first Ubuntu release whose
+    # qemu-user-static supports loongarch64.
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: loongarch64-unknown-linux-gnu
+      CROSS_TOOLCHAIN_PREFIX: loongarch64-linux-gnu
+      # Top-level directory created by the tarball below; it is not derived from
+      # the target triple, hence the explicit variable.
+      CROSS_TOOLCHAIN_TOP: gcc-13.2.0-loongarch64-linux-gnu
+      CROSS_TOOLCHAIN_URL: https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/gcc-13.2.0-loongarch64/gcc-13.2.0-loongarch64-linux-gnu.tgz
+      CROSS_TOOLCHAIN_SHA256: 1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380
+    steps:
+      - uses: actions/checkout@v4
+
+      # loongarch64-unknown-linux-gnu is a Tier 2 target with host tools: rustup
+      # ships prebuilt rust-std for it, so no nightly/-Z build-std is needed.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: loongarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-rust
+          key: ${{ env.TARGET }}
+
+      - name: Install LoongArch64 GNU cross toolchain
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-gnu.tgz "$CROSS_TOOLCHAIN_URL"
+          echo "${CROSS_TOOLCHAIN_SHA256}  /tmp/loongarch64-linux-gnu.tgz" | sha256sum -c -
+          sudo tar -xf /tmp/loongarch64-linux-gnu.tgz -C /opt
+          "/opt/${CROSS_TOOLCHAIN_TOP}/bin/${CROSS_TOOLCHAIN_PREFIX}-gcc" --version
+          echo "/opt/${CROSS_TOOLCHAIN_TOP}/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release --target "$TARGET"
+        env:
+          OPENSSL_VENDORED: 1
+          # Cargo has to be told which linker to use for the target; the vendored C
+          # dependencies (libgit2, OpenSSL, tree-sitter grammars) are compiled by
+          # cc-rs, which otherwise falls back to the host x86_64 `cc`.
+          CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER: loongarch64-linux-gnu-gcc
+          CC_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-gcc
+          CXX_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-g++
+          AR_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ar
+          RANLIB_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ranlib
+
+      - name: Verify binary targets LoongArch64
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/gitlogue"
+          file "$BIN"
+          python3 - "$BIN" <<'PY'
+          import struct, sys
+
+          with open(sys.argv[1], "rb") as fh:
+              data = fh.read()
+
+          assert data[:4] == b"\x7fELF", "not an ELF file"
+          assert data[4] == 2 and data[5] == 1, "not a 64-bit little-endian ELF file"
+
+          machine = struct.unpack_from("<H", data, 18)[0]
+          assert machine == 258, f"e_machine={machine}, expected 258 (EM_LOONGARCH)"
+
+          print("OK: LoongArch64 ELF executable")
+          PY
+
+      - name: Smoke test under QEMU
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          BIN="target/${TARGET}/release/gitlogue"
+
+          # The binary is dynamically linked, so QEMU has to resolve the emulated
+          # loader and every shared object it needs from the cross toolchain rather
+          # than from the host. glibc ships inside the toolchain's sysroot, but the
+          # GNU runtime libraries (libgcc_s.so.1, which the binary links against for
+          # unwinding) are installed next to the compiler instead, so ask the
+          # compiler where both groups of libraries live.
+          SYSROOT="$(${CROSS_TOOLCHAIN_PREFIX}-gcc -print-sysroot)"
+          if [ ! -d "$SYSROOT" ]; then
+            SYSROOT="/opt/${CROSS_TOOLCHAIN_TOP}/sysroot"
+          fi
+          LIBDIR=""
+          for candidate in usr/lib64 lib64 usr/lib lib; do
+            if [ -d "$SYSROOT/$candidate" ]; then
+              LIBDIR="$SYSROOT/$candidate"
+              break
+            fi
+          done
+          if [ -z "$LIBDIR" ]; then
+            echo "No libc directory found under $SYSROOT" >&2
+            exit 1
+          fi
+
+          TOOLCHAIN_ROOT="$(cd "$(dirname "$(command -v "${CROSS_TOOLCHAIN_PREFIX}-gcc")")/.." && pwd)"
+          RUNTIME_DIRS=("$LIBDIR")
+          RUNTIME_PATH="$LIBDIR"
+          for probe in libgcc_s.so.1 libstdc++.so.6; do
+            resolved="$(${CROSS_TOOLCHAIN_PREFIX}-gcc -print-file-name="$probe")"
+            [ -f "$resolved" ] || continue
+            libdir="$(dirname "$resolved")"
+            case ":$RUNTIME_PATH:" in
+              *":$libdir:"*) ;;
+              *)
+                RUNTIME_DIRS+=("$libdir")
+                RUNTIME_PATH="$RUNTIME_PATH:$libdir"
+                ;;
+            esac
+          done
+          echo "sysroot=$SYSROOT libdir=$LIBDIR runtime_path=$RUNTIME_PATH"
+          readelf -l "$BIN" | grep INTERP || true
+
+          # This toolchain installs glibc into /usr/lib64, while the executable asks
+          # for its loader under /lib64, so build a prefix that mirrors the layout
+          # the emulated loader expects. The libraries are copied rather than
+          # symlinked so that nothing inside the prefix points back out of it.
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/usr/lib64"
+          for dir in lib lib64 usr/lib; do
+            ln -s "$STAGE/usr/lib64" "$STAGE/$dir"
+          done
+          for dir in "${RUNTIME_DIRS[@]}"; do
+            find "$dir" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) \
+              -exec cp -Lf {} "$STAGE/usr/lib64/" \;
+          done
+
+          # Every DT_NEEDED entry has to be resolvable inside the stage; for the ones
+          # the runtime directories above do not cover, fall back to a search of the
+          # whole toolchain, so a missing library is reported here instead of as a
+          # loader error later on.
+          readelf -d "$BIN" | awk '/NEEDED/ { gsub(/[][]/, "", $NF); print $NF }' | sort -u |
+            while read -r needed; do
+              if [ -e "$STAGE/usr/lib64/$needed" ]; then
+                continue
+              fi
+              found="$(find "$TOOLCHAIN_ROOT" "$SYSROOT" -name "$needed" -print -quit 2>/dev/null)"
+              if [ -z "$found" ]; then
+                echo "No LoongArch64 $needed found anywhere under $TOOLCHAIN_ROOT" >&2
+                exit 1
+              fi
+              echo "staging $needed from $found"
+              cp -Lf "$found" "$STAGE/usr/lib64/$needed"
+            done
+
+          # QEMU resolves the loader through the staged prefix; LD_LIBRARY_PATH
+          # additionally points the emulated loader at the toolchain's runtime
+          # directories.
+          export QEMU_LD_PREFIX="$STAGE"
+          export LD_LIBRARY_PATH="$RUNTIME_PATH"
+
+          qemu-loongarch64-static "$BIN" --version
+          # Exercises real code paths (theme registry, config lookup), not just clap.
+          qemu-loongarch64-static "$BIN" theme list
+
   nix-build:
     name: Nix Build
     runs-on: ubuntu-22.04

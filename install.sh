@@ -51,6 +51,9 @@ detect_platform() {
                 aarch64|arm64)
                     echo "aarch64-unknown-linux-gnu"
                     ;;
+                loongarch64|loong64)
+                    echo "loongarch64-unknown-linux-gnu"
+                    ;;
                 *)
                     echo "Unsupported architecture: $ARCH" >&2
                     exit 1
