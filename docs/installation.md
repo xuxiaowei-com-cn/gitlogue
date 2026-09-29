@@ -86,7 +86,7 @@ Pre-built binaries for multiple platforms are available in the [Releases](https:
 **Supported platforms:**
 - macOS (Intel: x86_64, Apple Silicon: aarch64)
 - Linux (x64: x86_64, ARM64: aarch64)
-- Linux (LoongArch64: loongarch64, statically linked musl build)
+- Linux (LoongArch64: loongarch64)
 - Windows (x64: x86_64)
 
 The downloadable archives are named `gitlogue-<version>-<target>.tar.gz`:
@@ -97,7 +97,7 @@ The downloadable archives are named `gitlogue-<version>-<target>.tar.gz`:
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Linux x64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| Linux LoongArch64 | `loongarch64-unknown-linux-musl` |
+| Linux LoongArch64 | `loongarch64-unknown-linux-gnu` |
 | Windows x64 | `x86_64-pc-windows-msvc` |
 
 **Manual installation:**
@@ -194,11 +194,12 @@ This trades the Perl requirement for a runtime dependency on the system
 
 ### Linux (LoongArch64 / 龙芯)
 
-The LoongArch64 release is a **statically linked** binary
-(`loongarch64-unknown-linux-musl`), so it does not depend on the system glibc
-version and runs on any LoongArch64 Linux distribution — Loongnix, Kylin,
-openEuler, Debian/Ubuntu `loong64`, Arch Linux and others. `install.sh` picks it
-up automatically, and no glibc version check is performed for it.
+The LoongArch64 release (`loongarch64-unknown-linux-gnu`) is cross-compiled
+against a glibc sysroot, so it follows the same glibc requirement as the other
+Linux builds (glibc 2.35 or newer) and runs on glibc based LoongArch64
+distributions — Loongnix, Kylin, openEuler, Debian/Ubuntu `loong64`, Arch Linux
+and others. `install.sh` picks it up automatically and performs the same glibc
+version check it does for x86_64 and aarch64.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/unhappychoice/gitlogue/main/install.sh | bash
@@ -418,10 +419,8 @@ This means your system's glibc version is older than what the pre-built binary r
    nix run github:unhappychoice/gitlogue
    ```
 
-Only the dynamically linked `x86_64-unknown-linux-gnu` and
-`aarch64-unknown-linux-gnu` builds are affected. The LoongArch64 release
-(`loongarch64-unknown-linux-musl`) is statically linked and has no glibc
-requirement.
+All three Linux builds (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
+and `loongarch64-unknown-linux-gnu`) are dynamically linked and affected.
 
 ## Next Steps
 

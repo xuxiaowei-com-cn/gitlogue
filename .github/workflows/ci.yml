@@ -76,15 +76,19 @@ jobs:
 
   build-loongarch64:
     name: Build (LoongArch64)
-    # LoongArch64 (龙芯) is cross-compiled from an x86_64 runner. ubuntu-24.04 is
-    # required because QEMU 8.2 (used for the smoke test below) is the first Ubuntu
-    # release whose qemu-user-static supports loongarch64.
+    # LoongArch64 (龙芯) is cross-compiled from an x86_64 runner with a GNU
+    # toolchain (glibc sysroot), mirroring the released
+    # loongarch64-unknown-linux-gnu artifact. ubuntu-24.04 is required because
+    # QEMU 8.2 (used for the smoke test below) is the first Ubuntu release whose
+    # qemu-user-static supports loongarch64.
     runs-on: ubuntu-24.04
     env:
       TARGET: loongarch64-unknown-linux-gnu
-      CROSS_PREFIX: loongarch64-linux-gnu
+      CROSS_TOOLCHAIN_PREFIX: loongarch64-linux-gnu
+      # Top-level directory created by the tarball below; it is not derived from
+      # the target triple, hence the explicit variable.
+      CROSS_TOOLCHAIN_TOP: gcc-13.2.0-loongarch64-linux-gnu
       CROSS_TOOLCHAIN_URL: https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/gcc-13.2.0-loongarch64/gcc-13.2.0-loongarch64-linux-gnu.tgz
-      # SHA-256 of the tarball served by CROSS_TOOLCHAIN_URL.
       CROSS_TOOLCHAIN_SHA256: 1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380
     steps:
       - uses: actions/checkout@v4
@@ -103,31 +107,26 @@ jobs:
       - name: Install LoongArch64 GNU cross toolchain
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-gnu-cross.tgz "$CROSS_TOOLCHAIN_URL"
-          echo "${CROSS_TOOLCHAIN_SHA256}  /tmp/loongarch64-linux-gnu-cross.tgz" | sha256sum -c -
-          # The tarball unpacks to a single gcc-13.2.0-loongarch64-linux-gnu/
-          # directory, so strip that level and install into /opt/<triple>-cross.
-          sudo mkdir -p "/opt/${CROSS_PREFIX}-cross"
-          sudo tar -xf /tmp/loongarch64-linux-gnu-cross.tgz -C "/opt/${CROSS_PREFIX}-cross" --strip-components=1
-          "/opt/${CROSS_PREFIX}-cross/bin/${CROSS_PREFIX}-gcc" --version
-          echo "/opt/${CROSS_PREFIX}-cross/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-gnu.tgz "$CROSS_TOOLCHAIN_URL"
+          echo "${CROSS_TOOLCHAIN_SHA256}  /tmp/loongarch64-linux-gnu.tgz" | sha256sum -c -
+          sudo tar -xf /tmp/loongarch64-linux-gnu.tgz -C /opt
+          "/opt/${CROSS_TOOLCHAIN_TOP}/bin/${CROSS_TOOLCHAIN_PREFIX}-gcc" --version
+          echo "/opt/${CROSS_TOOLCHAIN_TOP}/bin" >> "$GITHUB_PATH"
 
       - name: Build
         run: cargo build --release --target "$TARGET"
         env:
-          # +crt-static is required by the verification step below, which asserts the
-          # binary carries no PT_INTERP (i.e. does not need a dynamic loader), and
-          # panic=abort avoids pulling a dynamic unwinder into a static binary.
-          RUSTFLAGS: "-C panic=abort -C target-feature=+crt-static"
+          OPENSSL_VENDORED: 1
+          # Cargo has to be told which linker to use for the target; the vendored C
+          # dependencies (libgit2, OpenSSL, tree-sitter grammars) are compiled by
+          # cc-rs, which otherwise falls back to the host x86_64 `cc`.
           CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER: loongarch64-linux-gnu-gcc
-          # The vendored C dependencies (libgit2, OpenSSL, tree-sitter grammars) are
-          # compiled by cc-rs, which has no built-in prefix mapping for this target.
           CC_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-gcc
           CXX_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-g++
           AR_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ar
           RANLIB_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ranlib
 
-      - name: Verify binary is a static LoongArch64 executable
+      - name: Verify binary targets LoongArch64
         run: |
           set -euo pipefail
           BIN="target/${TARGET}/release/gitlogue"
@@ -144,14 +143,7 @@ jobs:
           machine = struct.unpack_from("<H", data, 18)[0]
           assert machine == 258, f"e_machine={machine}, expected 258 (EM_LOONGARCH)"
 
-          # PT_INTERP (type 3) exists only in dynamically linked executables.
-          phoff = struct.unpack_from("<Q", data, 32)[0]
-          phentsize, phnum = struct.unpack_from("<HH", data, 54)
-          ptype_offsets = [phoff + i * phentsize for i in range(phnum)]
-          ptypes = {struct.unpack_from("<I", data, off)[0] for off in ptype_offsets}
-          assert 3 not in ptypes, "PT_INTERP found: binary is dynamically linked"
-
-          print("OK: statically linked LoongArch64 executable")
+          print("OK: LoongArch64 ELF executable")
           PY
 
       - name: Smoke test under QEMU
@@ -160,9 +152,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-user-static
           BIN="target/${TARGET}/release/gitlogue"
-          qemu-loongarch64-static "$BIN" --version
+
+          # The binary is dynamically linked, so QEMU has to resolve the emulated
+          # loader and libc from the toolchain's sysroot instead of the host's.
+          SYSROOT="$(${CROSS_TOOLCHAIN_PREFIX}-gcc -print-sysroot)"
+          if [ ! -d "$SYSROOT" ]; then
+            SYSROOT="/opt/${CROSS_TOOLCHAIN_TOP}/sysroot"
+          fi
+          LIBDIR=""
+          for candidate in usr/lib64 lib64 usr/lib lib; do
+            if [ -d "$SYSROOT/$candidate" ]; then
+              LIBDIR="$SYSROOT/$candidate"
+              break
+            fi
+          done
+          if [ -z "$LIBDIR" ]; then
+            echo "No libc directory found under $SYSROOT" >&2
+            exit 1
+          fi
+          echo "sysroot=$SYSROOT libdir=$LIBDIR"
+          readelf -l "$BIN" | grep INTERP || true
+
+          # This toolchain installs glibc into /usr/lib64, while the executable asks
+          # for its loader under /lib64, so hand QEMU a prefix where both exist.
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/usr"
+          for dir in lib lib64 usr/lib usr/lib64; do
+            ln -s "$LIBDIR" "$STAGE/$dir"
+          done
+
+          QEMU_LD_PREFIX="$STAGE" qemu-loongarch64-static "$BIN" --version
           # Exercises real code paths (theme registry, config lookup), not just clap.
-          qemu-loongarch64-static "$BIN" theme list
+          QEMU_LD_PREFIX="$STAGE" qemu-loongarch64-static "$BIN" theme list
 
   nix-build:
     name: Nix Build

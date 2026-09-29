@@ -72,36 +72,37 @@ cargo run -- --theme dracula
 
 ### Cross-compiling for LoongArch64 (龙芯)
 
-The LoongArch64 release artifact (`loongarch64-unknown-linux-musl`) is cross-compiled
-on an x86_64 Linux host. The same steps run in the release workflow
-(`.github/workflows/release.yml`); CI (`.github/workflows/ci.yml`) cross-compiles the
-glibc flavour (`loongarch64-unknown-linux-gnu`) the same way, using the
-`gcc-13.2.0-loongarch64-linux-gnu` toolchain:
+The LoongArch64 release artifact (`loongarch64-unknown-linux-gnu`) is cross-compiled
+on an x86_64 Linux host. The same steps run in CI (`.github/workflows/ci.yml`):
 
 ```bash
 # 1. Add the target (Tier 2, rustup ships prebuilt rust-std for it)
-rustup target add loongarch64-unknown-linux-musl
+rustup target add loongarch64-unknown-linux-gnu
 
-# 2. Install the LoongArch64 musl cross toolchain
-curl -fsSL -o /tmp/loongarch64-linux-musl-cross.tgz \
-  https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/loongarch64-linux-musl-cross-gcc-13.2.0/loongarch64-linux-musl-cross.tgz
-sudo tar -xf /tmp/loongarch64-linux-musl-cross.tgz -C /opt
-export PATH="/opt/loongarch64-linux-musl-cross/bin:$PATH"
+# 2. Install the LoongArch64 GNU cross toolchain
+curl -fsSL -o /tmp/gcc-13.2.0-loongarch64-linux-gnu.tgz \
+  https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/gcc-13.2.0-loongarch64/gcc-13.2.0-loongarch64-linux-gnu.tgz
+sudo tar -xf /tmp/gcc-13.2.0-loongarch64-linux-gnu.tgz -C /opt
+export PATH="/opt/gcc-13.2.0-loongarch64-linux-gnu/bin:$PATH"
 
-# 3. Build a static binary
-#    +crt-static is required (the target does not default to static linking) and
-#    panic=abort avoids the TLS dependent panic path of static loongarch64 musl builds
-export RUSTFLAGS="-C panic=abort -C target-feature=+crt-static"
-export CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_MUSL_LINKER=loongarch64-linux-musl-gcc
-export CC_loongarch64_unknown_linux_musl=loongarch64-linux-musl-gcc
-export CXX_loongarch64_unknown_linux_musl=loongarch64-linux-musl-g++
-export AR_loongarch64_unknown_linux_musl=loongarch64-linux-musl-ar
-export RANLIB_loongarch64_unknown_linux_musl=loongarch64-linux-musl-ranlib
-cargo build --release --target loongarch64-unknown-linux-musl
+# 3. Build (the cross compiler links against the glibc in its own sysroot)
+export CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER=loongarch64-linux-gnu-gcc
+export CC_loongarch64_unknown_linux_gnu=loongarch64-linux-gnu-gcc
+export CXX_loongarch64_unknown_linux_gnu=loongarch64-linux-gnu-g++
+export AR_loongarch64_unknown_linux_gnu=loongarch64-linux-gnu-ar
+export RANLIB_loongarch64_unknown_linux_gnu=loongarch64-linux-gnu-ranlib
+cargo build --release --target loongarch64-unknown-linux-gnu
 
-# 4. Run it on an x86_64 host through QEMU (requires QEMU >= 8.1)
+# 4. Run it on an x86_64 host through QEMU (requires QEMU >= 8.1). The binary is
+#    dynamically linked, so QEMU has to find the emulated loader and libc in the
+#    toolchain's sysroot; that sysroot keeps glibc in /usr/lib64 while the binary
+#    asks for its loader under /lib64, so expose both layouts in a staging prefix.
 sudo apt-get install -y qemu-user-static
-qemu-loongarch64-static target/loongarch64-unknown-linux-musl/release/gitlogue --version
+SYSROOT="$(loongarch64-linux-gnu-gcc -print-sysroot)"
+STAGE="$(mktemp -d)"; mkdir -p "$STAGE/usr"
+for d in lib lib64 usr/lib usr/lib64; do ln -s "$SYSROOT/usr/lib64" "$STAGE/$d"; done
+QEMU_LD_PREFIX="$STAGE" qemu-loongarch64-static \
+  target/loongarch64-unknown-linux-gnu/release/gitlogue --version
 ```
 
 ### Running Tests
