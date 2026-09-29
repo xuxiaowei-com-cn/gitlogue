@@ -157,7 +157,7 @@ jobs:
           # from the target triple, hence the explicit variable.
           CROSS_TOOLCHAIN_TOP: gcc-13.2.0-loongarch64-linux-gnu
           CROSS_TOOLCHAIN_URL: https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/gcc-13.2.0-loongarch64/gcc-13.2.0-loongarch64-linux-gnu.tgz
-          CROSS_TOOLCHAIN_SHA256: PLACEHOLDER_TOOLCHAIN_SHA256
+          CROSS_TOOLCHAIN_SHA256: 1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-gnu.tgz "$CROSS_TOOLCHAIN_URL"
@@ -184,7 +184,11 @@ jobs:
           file "$BIN"
 
           # The binary is dynamically linked, so QEMU has to resolve the emulated
-          # loader and libc from the toolchain's sysroot instead of the host's.
+          # loader and every shared object it needs from the cross toolchain rather
+          # than from the host. glibc ships inside the toolchain's sysroot, but the
+          # GNU runtime libraries (libgcc_s.so.1, which the binary links against for
+          # unwinding) are installed next to the compiler instead, so ask the
+          # compiler where both groups of libraries live.
           SYSROOT="$(loongarch64-linux-gnu-gcc -print-sysroot)"
           if [ ! -d "$SYSROOT" ]; then
             SYSROOT="/opt/gcc-13.2.0-loongarch64-linux-gnu/sysroot"
@@ -200,20 +204,66 @@ jobs:
             echo "No libc directory found under $SYSROOT" >&2
             exit 1
           fi
-          echo "sysroot=$SYSROOT libdir=$LIBDIR"
+
+          TOOLCHAIN_ROOT="$(cd "$(dirname "$(command -v loongarch64-linux-gnu-gcc)")/.." && pwd)"
+          RUNTIME_DIRS=("$LIBDIR")
+          RUNTIME_PATH="$LIBDIR"
+          for probe in libgcc_s.so.1 libstdc++.so.6; do
+            resolved="$(loongarch64-linux-gnu-gcc -print-file-name="$probe")"
+            [ -f "$resolved" ] || continue
+            libdir="$(dirname "$resolved")"
+            case ":$RUNTIME_PATH:" in
+              *":$libdir:"*) ;;
+              *)
+                RUNTIME_DIRS+=("$libdir")
+                RUNTIME_PATH="$RUNTIME_PATH:$libdir"
+                ;;
+            esac
+          done
+          echo "sysroot=$SYSROOT libdir=$LIBDIR runtime_path=$RUNTIME_PATH"
           readelf -l "$BIN" | grep INTERP || true
 
           # This toolchain installs glibc into /usr/lib64, while the executable asks
-          # for its loader under /lib64, so hand QEMU a prefix where both exist.
+          # for its loader under /lib64, so build a prefix that mirrors the layout
+          # the emulated loader expects. The libraries are copied rather than
+          # symlinked so that nothing inside the prefix points back out of it.
           STAGE="$(mktemp -d)"
-          mkdir -p "$STAGE/usr"
-          for dir in lib lib64 usr/lib usr/lib64; do
-            ln -s "$LIBDIR" "$STAGE/$dir"
+          mkdir -p "$STAGE/usr/lib64"
+          for dir in lib lib64 usr/lib; do
+            ln -s "$STAGE/usr/lib64" "$STAGE/$dir"
+          done
+          for dir in "${RUNTIME_DIRS[@]}"; do
+            find "$dir" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) \
+              -exec cp -Lf {} "$STAGE/usr/lib64/" \;
           done
 
-          QEMU_LD_PREFIX="$STAGE" qemu-loongarch64-static "$BIN" --version
+          # Every DT_NEEDED entry has to be resolvable inside the stage; for the ones
+          # the runtime directories above do not cover, fall back to a search of the
+          # whole toolchain, so a missing library is reported here instead of as a
+          # loader error later on.
+          readelf -d "$BIN" | awk '/NEEDED/ { gsub(/[][]/, "", $NF); print $NF }' | sort -u |
+            while read -r needed; do
+              if [ -e "$STAGE/usr/lib64/$needed" ]; then
+                continue
+              fi
+              found="$(find "$TOOLCHAIN_ROOT" "$SYSROOT" -name "$needed" -print -quit 2>/dev/null)"
+              if [ -z "$found" ]; then
+                echo "No LoongArch64 $needed found anywhere under $TOOLCHAIN_ROOT" >&2
+                exit 1
+              fi
+              echo "staging $needed from $found"
+              cp -Lf "$found" "$STAGE/usr/lib64/$needed"
+            done
+
+          # QEMU resolves the loader through the staged prefix; LD_LIBRARY_PATH
+          # additionally points the emulated loader at the toolchain's runtime
+          # directories.
+          export QEMU_LD_PREFIX="$STAGE"
+          export LD_LIBRARY_PATH="$RUNTIME_PATH"
+
+          qemu-loongarch64-static "$BIN" --version
           # Exercises real code paths (theme registry, config lookup), not just clap.
-          QEMU_LD_PREFIX="$STAGE" qemu-loongarch64-static "$BIN" theme list
+          qemu-loongarch64-static "$BIN" theme list
       - name: Create archive (Unix)
         if: matrix.os != 'windows-latest'
         run: |
