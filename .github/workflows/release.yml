@@ -135,6 +135,14 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # LoongArch64 (龙芯): cross-compiled on an x86_64 runner into a statically
+          # linked musl binary, so it runs on every LoongArch64 Linux distribution
+          # (Loongnix, Kylin, openEuler, Debian/Ubuntu loong64, Arch Linux, ...)
+          # independently of their glibc version. ubuntu-24.04 is needed for the
+          # QEMU 8.2 based smoke test below.
+          - target: loongarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            rustflags: "-C panic=abort -C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -143,10 +151,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install LoongArch64 musl cross toolchain
+        if: matrix.target == 'loongarch64-unknown-linux-musl'
+        env:
+          CROSS_TOOLCHAIN_URL: https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/loongarch64-linux-musl-cross-gcc-13.2.0/loongarch64-linux-musl-cross.tgz
+          CROSS_TOOLCHAIN_SHA256: 1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-musl-cross.tgz "$CROSS_TOOLCHAIN_URL"
+          echo "${CROSS_TOOLCHAIN_SHA256}  /tmp/loongarch64-linux-musl-cross.tgz" | sha256sum -c -
+          sudo tar -xf /tmp/loongarch64-linux-musl-cross.tgz -C /opt
+          echo "/opt/loongarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
         env:
           OPENSSL_VENDORED: 1
+          # Only set for loongarch64-unknown-linux-musl; empty for the native targets.
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          # Inert for the other targets, cargo only reads them for this one.
+          CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_MUSL_LINKER: loongarch64-linux-musl-gcc
+          CC_loongarch64_unknown_linux_musl: loongarch64-linux-musl-gcc
+          CXX_loongarch64_unknown_linux_musl: loongarch64-linux-musl-g++
+          AR_loongarch64_unknown_linux_musl: loongarch64-linux-musl-ar
+          RANLIB_loongarch64_unknown_linux_musl: loongarch64-linux-musl-ranlib
+      - name: Smoke test under QEMU (LoongArch64)
+        if: matrix.target == 'loongarch64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          BIN="target/${{ matrix.target }}/release/gitlogue"
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error file=${BIN}::binary is dynamically linked, expected a static executable"
+            exit 1
+          fi
+          qemu-loongarch64-static "$BIN" --version
+          # Exercises real code paths (theme registry, config lookup), not just clap.
+          qemu-loongarch64-static "$BIN" theme list
       - name: Create archive (Unix)
         if: matrix.os != 'windows-latest'
         run: |

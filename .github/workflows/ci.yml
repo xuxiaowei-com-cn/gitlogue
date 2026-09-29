@@ -74,6 +74,96 @@ jobs:
           prefix-key: v2-rust
       - run: cargo build --release
 
+  build-loongarch64:
+    name: Build (LoongArch64)
+    # LoongArch64 (龙芯) is cross-compiled from an x86_64 runner. ubuntu-24.04 is
+    # required because QEMU 8.2 (used for the smoke test below) is the first Ubuntu
+    # release whose qemu-user-static supports loongarch64.
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: loongarch64-unknown-linux-gnu
+      CROSS_PREFIX: loongarch64-linux-gnu
+      CROSS_TOOLCHAIN_URL: https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/gcc-13.2.0-loongarch64/gcc-13.2.0-loongarch64-linux-gnu.tgz
+      # SHA-256 of the tarball served by CROSS_TOOLCHAIN_URL.
+      CROSS_TOOLCHAIN_SHA256: 1acd6c2ae79d6e8c80ea6d5b20d6ee3d6f52944bc473c833047aa717e05a0380
+    steps:
+      - uses: actions/checkout@v4
+
+      # loongarch64-unknown-linux-gnu is a Tier 2 target with host tools: rustup
+      # ships prebuilt rust-std for it, so no nightly/-Z build-std is needed.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: loongarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-rust
+          key: ${{ env.TARGET }}
+
+      - name: Install LoongArch64 GNU cross toolchain
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/loongarch64-linux-gnu-cross.tgz "$CROSS_TOOLCHAIN_URL"
+          echo "${CROSS_TOOLCHAIN_SHA256}  /tmp/loongarch64-linux-gnu-cross.tgz" | sha256sum -c -
+          # The tarball unpacks to a single gcc-13.2.0-loongarch64-linux-gnu/
+          # directory, so strip that level and install into /opt/<triple>-cross.
+          sudo mkdir -p "/opt/${CROSS_PREFIX}-cross"
+          sudo tar -xf /tmp/loongarch64-linux-gnu-cross.tgz -C "/opt/${CROSS_PREFIX}-cross" --strip-components=1
+          "/opt/${CROSS_PREFIX}-cross/bin/${CROSS_PREFIX}-gcc" --version
+          echo "/opt/${CROSS_PREFIX}-cross/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release --target "$TARGET"
+        env:
+          # +crt-static is required by the verification step below, which asserts the
+          # binary carries no PT_INTERP (i.e. does not need a dynamic loader), and
+          # panic=abort avoids pulling a dynamic unwinder into a static binary.
+          RUSTFLAGS: "-C panic=abort -C target-feature=+crt-static"
+          CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER: loongarch64-linux-gnu-gcc
+          # The vendored C dependencies (libgit2, OpenSSL, tree-sitter grammars) are
+          # compiled by cc-rs, which has no built-in prefix mapping for this target.
+          CC_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-gcc
+          CXX_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-g++
+          AR_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ar
+          RANLIB_loongarch64_unknown_linux_gnu: loongarch64-linux-gnu-ranlib
+
+      - name: Verify binary is a static LoongArch64 executable
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/gitlogue"
+          file "$BIN"
+          python3 - "$BIN" <<'PY'
+          import struct, sys
+
+          with open(sys.argv[1], "rb") as fh:
+              data = fh.read()
+
+          assert data[:4] == b"\x7fELF", "not an ELF file"
+          assert data[4] == 2 and data[5] == 1, "not a 64-bit little-endian ELF file"
+
+          machine = struct.unpack_from("<H", data, 18)[0]
+          assert machine == 258, f"e_machine={machine}, expected 258 (EM_LOONGARCH)"
+
+          # PT_INTERP (type 3) exists only in dynamically linked executables.
+          phoff = struct.unpack_from("<Q", data, 32)[0]
+          phentsize, phnum = struct.unpack_from("<HH", data, 54)
+          ptype_offsets = [phoff + i * phentsize for i in range(phnum)]
+          ptypes = {struct.unpack_from("<I", data, off)[0] for off in ptype_offsets}
+          assert 3 not in ptypes, "PT_INTERP found: binary is dynamically linked"
+
+          print("OK: statically linked LoongArch64 executable")
+          PY
+
+      - name: Smoke test under QEMU
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          BIN="target/${TARGET}/release/gitlogue"
+          qemu-loongarch64-static "$BIN" --version
+          # Exercises real code paths (theme registry, config lookup), not just clap.
+          qemu-loongarch64-static "$BIN" theme list
+
   nix-build:
     name: Nix Build
     runs-on: ubuntu-22.04

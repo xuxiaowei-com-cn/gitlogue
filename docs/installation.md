@@ -5,7 +5,8 @@ This guide provides detailed instructions for installing gitlogue on different p
 ## Prerequisites
 
 - Git must be installed on your system
-- For building from source: Rust 1.70 or later
+- For building from source: Rust 1.70 or later, a C toolchain, and **Perl**
+  (see [Build Dependencies](#build-dependencies-perl) below)
 
 ## Installation Methods
 
@@ -18,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/unhappychoice/gitlogue/main/install
 ```
 
 This script will:
-- Automatically detect your platform (macOS Intel/ARM, Linux x64/ARM64)
+- Automatically detect your platform (macOS Intel/ARM, Linux x64/ARM64/LoongArch64)
 - Download the latest release binary
 - Install to `~/.local/bin` (customizable with `INSTALL_DIR` environment variable)
 
@@ -85,7 +86,19 @@ Pre-built binaries for multiple platforms are available in the [Releases](https:
 **Supported platforms:**
 - macOS (Intel: x86_64, Apple Silicon: aarch64)
 - Linux (x64: x86_64, ARM64: aarch64)
+- Linux (LoongArch64: loongarch64, statically linked musl build)
 - Windows (x64: x86_64)
+
+The downloadable archives are named `gitlogue-<version>-<target>.tar.gz`:
+
+| Platform | Target |
+| --- | --- |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| Linux x64 | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+| Linux LoongArch64 | `loongarch64-unknown-linux-musl` |
+| Windows x64 | `x86_64-pc-windows-msvc` |
 
 **Manual installation:**
 1. Download the appropriate archive for your platform
@@ -144,15 +157,65 @@ sudo apt update
 sudo apt install build-essential git
 ```
 
-**Fedora/RHEL:**
+**Fedora/RHEL (incl. Anolis, openEuler, Kylin):**
 ```bash
-sudo dnf install gcc git
+sudo dnf install gcc gcc-c++ make cmake pkgconf-pkg-config perl git
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S base-devel git
+sudo pacman -S base-devel perl git
 ```
+
+### Build Dependencies (Perl)
+
+gitlogue links libgit2 and OpenSSL **statically** (`vendored-openssl` +
+`vendored-libgit2`), so those C libraries are compiled from source as part of the
+build. OpenSSL's build system is driven by Perl scripts, which means `perl` must
+be on `PATH` even when a system OpenSSL is already installed — otherwise the build
+fails with `Command 'perl' not found. Is perl installed?`.
+
+Minimal server installs (Anolis, openEuler, Kylin, RHEL, and slim containers) often
+ship without Perl, so install it before building from source:
+```bash
+sudo dnf install -y perl          # Fedora/RHEL/Anolis/openEuler/Kylin
+sudo apt install -y perl          # Debian/Ubuntu
+perl -v                            # verify
+```
+
+If you would rather not install Perl at all, build against the system OpenSSL
+instead of the vendored copy (requires the OpenSSL development headers, 3.x):
+```bash
+sudo dnf install -y openssl-devel
+OPENSSL_NO_VENDOR=1 cargo install gitlogue
+```
+This trades the Perl requirement for a runtime dependency on the system
+`libssl.so.3`/`libcrypto.so.3`.
+
+### Linux (LoongArch64 / 龙芯)
+
+The LoongArch64 release is a **statically linked** binary
+(`loongarch64-unknown-linux-musl`), so it does not depend on the system glibc
+version and runs on any LoongArch64 Linux distribution — Loongnix, Kylin,
+openEuler, Debian/Ubuntu `loong64`, Arch Linux and others. `install.sh` picks it
+up automatically, and no glibc version check is performed for it.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/unhappychoice/gitlogue/main/install.sh | bash
+```
+
+Rust publishes official host tools for LoongArch64, so building natively on a
+LoongArch64 machine also works:
+
+```bash
+cargo install gitlogue
+```
+
+Prefer the **install script over `cargo install`** on LoongArch64: the pre-built
+binary needs no compiler, no Perl, and no long native build (compiling the
+vendored libgit2 + OpenSSL on LoongArch64 takes tens of minutes). If you do build
+from source, install the [build dependencies](#build-dependencies-perl) first —
+Anolis, Kylin, and openEuler images usually need `perl` installed explicitly.
 
 ### Windows
 
@@ -265,6 +328,53 @@ If you encounter build errors:
    cargo build --release
    ```
 
+3. Install the [build dependencies](#build-dependencies-perl) — in particular
+   `perl`, which is required for the vendored OpenSSL build.
+
+### `perl` Not Found (openssl-sys) During Source Build
+
+If `cargo install gitlogue` or `cargo build` fails with:
+
+```
+warning: openssl-sys@0.9.117: configuring OpenSSL build: Command 'perl' not found. Is perl installed?
+warning: openssl-sys@0.9.117: openssl-src: failed to build OpenSSL from source
+error: failed to run custom build command for `openssl-sys v0.9.117`
+```
+
+the compiler is fine — Perl is simply missing. Because gitlogue enables
+`vendored-openssl`, OpenSSL is built from source, and OpenSSL's build system is
+written in Perl.
+
+**Solutions:**
+
+1. **Install Perl** (recommended):
+   ```bash
+   sudo dnf install -y perl    # Fedora/RHEL/Anolis/openEuler/Kylin
+   sudo apt install -y perl    # Debian/Ubuntu
+   cargo install gitlogue
+   ```
+
+2. **Use the system OpenSSL instead of the vendored one** (no Perl needed):
+   ```bash
+   sudo dnf install -y openssl-devel
+   OPENSSL_NO_VENDOR=1 cargo install gitlogue
+   ```
+
+3. **Skip the build entirely** by using the pre-built binary, which is linked
+   statically and therefore needs no toolchain, no Perl, and no matching system
+   OpenSSL:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/unhappychoice/gitlogue/main/install.sh | bash
+   ```
+
+On slower CPUs (for example LoongArch64) the vendored build also takes a long
+time because it compiles libgit2 and OpenSSL from source. `cargo install` builds
+in a throwaway temporary directory by default, so an interrupted build starts
+over. Point it at a persistent directory to make retries cheap:
+```bash
+CARGO_TARGET_DIR=$HOME/.cache/gitlogue-build cargo install gitlogue
+```
+
 ### Permission Errors
 
 On Linux/macOS, if you encounter permission errors during installation, you may need to use `sudo`:
@@ -307,6 +417,11 @@ This means your system's glibc version is older than what the pre-built binary r
    ```bash
    nix run github:unhappychoice/gitlogue
    ```
+
+Only the dynamically linked `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu` builds are affected. The LoongArch64 release
+(`loongarch64-unknown-linux-musl`) is statically linked and has no glibc
+requirement.
 
 ## Next Steps
 

@@ -43,13 +43,20 @@ detect_platform() {
 
     case "$OS" in
         Linux*)
-            check_glibc_version
             case "$ARCH" in
                 x86_64)
+                    check_glibc_version
                     echo "x86_64-unknown-linux-gnu"
                     ;;
                 aarch64|arm64)
+                    check_glibc_version
                     echo "aarch64-unknown-linux-gnu"
+                    ;;
+                loongarch64|loong64)
+                    # Statically linked musl build: no glibc dependency, so it runs on
+                    # any LoongArch64 Linux (Loongnix, Kylin, openEuler, Debian/Ubuntu
+                    # loong64, Arch Linux, ...) without a glibc version check.
+                    echo "loongarch64-unknown-linux-musl"
                     ;;
                 *)
                     echo "Unsupported architecture: $ARCH" >&2
